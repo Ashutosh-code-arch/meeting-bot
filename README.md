@@ -14,7 +14,7 @@ Records Google Meet audio + your microphone, then automatically:
 
 ---
 
-## Quick start (Day 1)
+## Quick start
 
 ### Prerequisites
 
@@ -26,8 +26,8 @@ Records Google Meet audio + your microphone, then automatically:
 ### Install
 
 ```bash
-git clone https://github.com/yourname/meetingbot
-cd meetingbot
+git clone https://github.com/Ashutosh-code-arch/meeting-bot
+cd meeting-bot
 bash install.sh
 ```
 
