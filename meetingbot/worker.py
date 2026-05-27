@@ -1,11 +1,29 @@
-import time, logging, traceback, json
+# meetingbot/worker.py
+# Background job processor.
+# Run in a separate terminal: make worker
+# Polls the SQLite job queue every 5 seconds and processes one step at a time.
+
+import json
+import logging
+import subprocess
+import time
+import traceback
+
 from pathlib import Path
-from .db import get_conn, claim_job, complete_job, fail_job, get_meeting_result
 from .config import AUDIO_DIR
+from .db import (
+    claim_job, complete_job, fail_job,
+    get_conn, get_meeting_result,
+)
 
 log = logging.getLogger(__name__)
-POLL = 5  # seconds between queue polls
+POLL_INTERVAL = 5  # seconds between queue polls
 
+# Steps run in this order. Each step depends on the previous one completing.
+STEP_ORDER = ["transcribe", "diarize", "merge", "summarize", "export"]
+
+
+# ── Step handlers ──────────────────────────────────────────────────────────────
 
 def step_transcribe(conn, mid: int) -> dict:
     from .transcribe import load_whisper, transcribe_all_chunks, unload_whisper
@@ -13,29 +31,51 @@ def step_transcribe(conn, mid: int) -> dict:
 
     chunks = sorted(AUDIO_DIR.glob(f"mtg{mid:04d}_chunk*.wav"))
     if not chunks:
-        raise FileNotFoundError(f"No chunks for meeting {mid}")
-    model = load_whisper()
+        raise FileNotFoundError(
+            f"No audio chunks found for meeting {mid} in {AUDIO_DIR}. "
+            f"Expected files matching: mtg{mid:04d}_chunk*.wav"
+        )
+
+    log.info(f"[transcribe] meeting={mid}, {len(chunks)} chunks")
+    model   = load_whisper()
     results = transcribe_all_chunks(model, chunks)
-    merged = merge_chunk_results(results)
+    merged  = merge_chunk_results(results)
     unload_whisper()
-    return {"segments": merged["segments"], "chunk_count": len(chunks)}
+
+    word_count = sum(
+        len(seg.get("words", []))
+        for seg in merged["segments"]
+    )
+    return {
+        "segments":    merged["segments"],
+        "language":    merged.get("language", "hi"),
+        "chunk_count": len(chunks),
+        "word_count":  word_count,
+    }
 
 
 def step_diarize(conn, mid: int) -> dict:
     from .audio_utils import concat_wav_chunks, get_duration_seconds
     from .diarize import load_diarizer, diarize, unload_diarizer
 
-    chunks = sorted(AUDIO_DIR.glob(f"mtg{mid:04d}_chunk*.wav"))
+    chunks   = sorted(AUDIO_DIR.glob(f"mtg{mid:04d}_chunk*.wav"))
     full_wav = AUDIO_DIR / f"mtg{mid:04d}_full.wav"
+
     if not full_wav.exists():
+        if not chunks:
+            raise FileNotFoundError(f"No chunks or full WAV for meeting {mid}")
         concat_wav_chunks(chunks, full_wav)
-    dur = get_duration_seconds(full_wav)
-    pipe = load_diarizer()
-    segs = diarize(pipe, full_wav)
+
+    duration = get_duration_seconds(full_wav)
+    log.info(f"[diarize] meeting={mid}, duration={duration:.0f}s")
+
+    pipeline = load_diarizer()
+    segs     = diarize(pipeline, full_wav)
     unload_diarizer()
+
     return {
-        "segments": segs,
-        "duration_s": dur,
+        "segments":      segs,
+        "duration_s":    duration,
         "speaker_count": len(set(s["speaker"] for s in segs)),
     }
 
@@ -45,15 +85,22 @@ def step_merge(conn, mid: int) -> dict:
 
     tx = get_meeting_result(conn, mid, "transcribe")
     di = get_meeting_result(conn, mid, "diarize")
-    if not tx or not di:
-        raise RuntimeError("Missing transcribe or diarize results")
-    labelled = assign_speaker_to_words(tx["segments"], di["segments"])
+
+    if not tx:
+        raise RuntimeError(f"Transcribe result missing for meeting {mid}")
+    if not di:
+        raise RuntimeError(f"Diarize result missing for meeting {mid}")
+
+    log.info(f"[merge] meeting={mid}")
+    labelled   = assign_speaker_to_words(tx["segments"], di["segments"])
     utterances = group_utterances(labelled)
-    text = utterances_to_text(utterances)
+    text       = utterances_to_text(utterances)
+
     return {
-        "transcript_text": text,
-        "utterance_count": len(utterances),
-        "duration_min": di["duration_s"] / 60,
+        "transcript_text":  text,
+        "utterance_count":  len(utterances),
+        "duration_min":     di["duration_s"] / 60,
+        "speaker_count":    di["speaker_count"],
     }
 
 
@@ -62,65 +109,133 @@ def step_summarize(conn, mid: int) -> dict:
 
     mg = get_meeting_result(conn, mid, "merge")
     if not mg:
-        raise RuntimeError("Missing merge result")
-    row = conn.execute("SELECT title FROM meetings WHERE id=?", (mid,)).fetchone()
-    ttl = row["title"] if row else "Meeting"
-    msg = (
-        f"Meeting title: {ttl}\nDuration: {mg['duration_min']:.0f} min\n\n"
-        f"=== MEETING TRANSCRIPT ===\n{mg['transcript_text']}\n=== END TRANSCRIPT ==="
+        raise RuntimeError(f"Merge result missing for meeting {mid}")
+
+    row   = conn.execute("SELECT title FROM meetings WHERE id=?", (mid,)).fetchone()
+    title = row["title"] if row else "Meeting"
+
+    log.info(f"[summarize] meeting={mid}, title='{title}', "
+             f"{len(mg['transcript_text'])} chars")
+
+    user_msg = (
+        f"Meeting title: {title}\n"
+        f"Duration: {mg['duration_min']:.0f} minutes\n"
+        f"Speakers detected: {mg['speaker_count']}\n"
+        f"Total utterances: {mg['utterance_count']}\n\n"
+        f"=== MEETING TRANSCRIPT ===\n"
+        f"{mg['transcript_text']}\n"
+        f"=== END TRANSCRIPT ==="
     )
-    md = summarize(msg)
-    return {"markdown": md, "char_count": len(md)}
+
+    markdown = summarize(user_msg)
+    return {
+        "markdown":   markdown,
+        "char_count": len(markdown),
+    }
 
 
 def step_export(conn, mid: int) -> dict:
     from .export import export
+    from .audio_utils import cleanup_chunks
 
     sm = get_meeting_result(conn, mid, "summarize")
     if not sm:
-        raise RuntimeError("Missing summarize result")
-    row = conn.execute("SELECT title FROM meetings WHERE id=?", (mid,)).fetchone()
-    ttl = row["title"] if row else "Meeting"
-    p = export(sm["markdown"], mid, ttl, auto_open=True)
+        raise RuntimeError(f"Summarize result missing for meeting {mid}")
+
+    row   = conn.execute("SELECT title, duration_min FROM meetings WHERE id=?", (mid,)).fetchone()
+    title = row["title"]       if row else "Meeting"
+    dur   = row["duration_min"] if row else 0
+
+    log.info(f"[export] meeting={mid}")
+    paths = export(sm["markdown"], mid, title,
+                   duration_min=dur or 0, auto_open=True)
+
+    # Mark meeting as done
     conn.execute("UPDATE meetings SET status='done' WHERE id=?", (mid,))
     conn.commit()
-    return {"html": str(p["html"]), "md": str(p["markdown"])}
+
+    # Clean up raw audio chunks (keep full WAV)
+    chunks = sorted(AUDIO_DIR.glob(f"mtg{mid:04d}_chunk*.wav"))
+    cleanup_chunks(chunks)
+
+    # macOS notification
+    _notify("MeetingBot — Report ready! 🎉",
+            f"Meeting #{mid}: {title}",
+            f"Saved: {paths['html'].name}")
+
+    return {
+        "html_path": str(paths["html"]),
+        "md_path":   str(paths["markdown"]),
+    }
 
 
-STEPS = {
+# ── Step dispatch table ────────────────────────────────────────────────────────
+
+STEP_HANDLERS = {
     "transcribe": step_transcribe,
-    "diarize": step_diarize,
-    "merge": step_merge,
-    "summarize": step_summarize,
-    "export": step_export,
+    "diarize":    step_diarize,
+    "merge":      step_merge,
+    "summarize":  step_summarize,
+    "export":     step_export,
 }
 
 
+# ── Notification helper ────────────────────────────────────────────────────────
+
+def _notify(title: str, subtitle: str, message: str):
+    """Send a macOS notification via osascript (no extra deps needed)."""
+    try:
+        script = (
+            f'display notification "{message}" '
+            f'with title "{title}" '
+            f'subtitle "{subtitle}"'
+        )
+        subprocess.run(["osascript", "-e", script],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass  # notifications are best-effort
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
 def main():
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
-    log.info("Worker started. Polling every 5s...")
+    log.info("Worker started. Polling every 5s for queued jobs...")
+    log.info(f"Audio dir: {AUDIO_DIR}")
     conn = get_conn()
+
     while True:
-        worked = False
-        for step, handler in STEPS.items():
+        processed_any = False
+
+        # Process steps in order so dependencies are always satisfied
+        for step in STEP_ORDER:
             job = claim_job(conn, step)
-            if not job:
+            if job is None:
                 continue
-            jid, mid = job["id"], job["meeting_id"]
-            log.info(f"Job {jid}: step={step} meeting={mid}")
+
+            job_id     = job["id"]
+            meeting_id = job["meeting_id"]
+            handler    = STEP_HANDLERS[step]
+
+            log.info(f"▶ Job {job_id}: step={step} meeting={meeting_id}")
             try:
-                result = handler(conn, mid)
-                complete_job(conn, jid, result)
-                log.info(f"Job {jid} done")
+                result = handler(conn, meeting_id)
+                complete_job(conn, job_id, result)
+                log.info(f"✓ Job {job_id} ({step}) done")
             except Exception as e:
-                fail_job(conn, jid, f"{type(e).__name__}: {e}")
-                log.error(f"Job {jid} failed: {e}")
-            worked = True
-            break
-        if not worked:
-            time.sleep(POLL)
+                error_msg = f"{type(e).__name__}: {e}"
+                log.error(f"✗ Job {job_id} ({step}) failed: {error_msg}")
+                log.debug(traceback.format_exc())
+                fail_job(conn, job_id, error_msg)
+
+            processed_any = True
+            break  # Re-poll after each job so we always pick up in step order
+
+        if not processed_any:
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
